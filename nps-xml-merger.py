@@ -3,6 +3,20 @@
 Created by Claude AI assistant (3.7 Sonnet)
 Hierarchy-Preserving NPS XML Merger Script - Merges multiple Windows NPS export XML files
 while preserving the correct hierarchical structure and deduplicating elements.
+
+Generic Hierarchy-Preserving XML Merger Script
+
+This script merges multiple XML files while preserving the hierarchical structure
+and deduplicating elements that have <Properties> as a child element.
+Particularly useful for Windows NPS export files and similar hierarchical configurations.
+
+Usage:
+    python xml_merger.py [options] input1.xml input2.xml [input3.xml ...] -o output.xml
+
+Options:
+    -o, --output      Output file path (default: merged.xml)
+    -v, --verbose     Enable verbose output
+    -h, --help        Show help message
 """
 
 import os
@@ -21,79 +35,244 @@ def parse_xml_file(file_path):
         raise
 
 def get_element_id(element):
-    """Generate a unique identifier for an element."""
+    """Generate a unique identifier for an element based on tag and name attribute."""
     name = element.get('name', '')
     return f"{element.tag}:{name}"
 
-def get_full_path(element, root):
-    """Try to determine the full hierarchical path to an element."""
+def get_element_path(element, root):
+    """
+    Attempt to construct the hierarchical path to this element.
+    Returns a list of (tag, name_attr) tuples representing the path.
+    """
     path = []
     current = element
     
-    # Walk up the tree to build the path
-    while current is not None and current != root:
-        path.append((current.tag, current.get('name', '')))
-        parent = current.getparent() if hasattr(current, 'getparent') else None
-        current = parent
+    # This is a very simplified approach since ElementTree doesn't track parents
+    # In a real scenario, we'd need to search through the entire tree
     
-    # Reverse to get from root to element
-    path.reverse()
+    # Just return the element's tag since we can't easily determine the path
+    path.append((element.tag, element.get('name', '')))
     return path
 
-def find_correct_parent(base_root, element, source_root):
+def find_parent_by_path(root, path):
+    """
+    Find a parent element in the XML tree based on a path of (tag, name) tuples.
+    """
+    if not path:
+        return None
+    
+    # Start with all potential parent candidates
+    candidates = [root]
+    
+    # For each step in the path, filter down to matching elements
+    for tag, name in path[:-1]:  # Skip the last one as it's the element itself
+        new_candidates = []
+        for candidate in candidates:
+            for child in candidate:
+                if child.tag == tag and child.get('name', '') == name:
+                    new_candidates.append(child)
+        candidates = new_candidates
+        if not candidates:
+            return None
+    
+    # Return the first matching candidate, if any
+    return candidates[0] if candidates else None
+
+def find_matching_parent(base_root, element_tag, element_name, target_parent_tag=None):
+    """
+    Find the appropriate parent in the base XML for an element with the given tag and name.
+    
+    Args:
+        base_root: The root element of the base XML tree
+        element_tag: The tag of the element to place
+        element_name: The name attribute of the element to place
+        target_parent_tag: If provided, look for a parent with this specific tag
+        
+    Returns:
+        The appropriate parent element, or None if no suitable parent is found
+    """
+    # If a specific parent tag is provided, look for it
+    if target_parent_tag:
+        parents = base_root.findall(f".//*[tag='{target_parent_tag}']")
+        if parents:
+            return parents[0]
+    
+    # Look for existing siblings with the same tag
+    siblings = base_root.findall(f".//*/{element_tag}")
+    if siblings:
+        # Return the parent of the first sibling
+        for parent in base_root.findall(".//*"):
+            for child in parent:
+                if child.tag == element_tag:
+                    return parent
+    
+    # If no siblings found, try to find a "Children" container
+    children_containers = base_root.findall(".//Children")
+    if children_containers:
+        # Look for an appropriate container by checking its immediate children
+        for container in children_containers:
+            # If this container already has similar elements, use it
+            has_similar = False
+            for child in container:
+                if child.tag == element_tag or child.tag.endswith(element_tag.split('_')[-1]):
+                    has_similar = True
+                    break
+            if has_similar:
+                return container
+        
+        # If no suitable container found, use the first one
+        # This is a fallback and might not be ideal
+        return children_containers[0]
+    
+    # Last resort: return the root element
+    return base_root
+
+def get_existing_parent_map(root):
+    """
+    Create a map of each tag to its potential parent tags in the existing XML.
+    This helps determine where new elements should go.
+    """
+    parent_map = defaultdict(set)
+    
+    # For each element in the tree, record its children's tags
+    for parent in root.findall(".//*"):
+        for child in parent:
+            parent_map[child.tag].add(parent.tag)
+    
+    return parent_map
+
+def find_correct_parent(base_root, element, source_root=None):
     """
     Find the correct parent in the base XML tree for the given element.
-    This uses knowledge of the NPS XML structure.
+    
+    This function handles specific rules for NPS XML files:
+    1. RADIUS clients should go under Microsoft_Radius_Protocol/Children/Clients/Children
+    2. RadiusProfiles should go under RadiusProfiles/Children
+    3. Network Policies should go under NetworkPolicy/Children
+    
+    Args:
+        base_root: The root element of the base XML
+        element: The element to place
+        source_root: The root element of the source XML (for context)
+        
+    Returns:
+        The appropriate parent element in the base XML
     """
-    # First, identify what type of element this is and its expected location
     element_tag = element.tag
     element_name = element.get('name', '')
     
-    # Check if element has Properties as a direct child
-    has_properties = False
-    for child in element:
-        if child.tag == "Properties":
-            has_properties = True
-            break
+    # Check if this element has a Properties child
+    has_properties = any(child.tag == "Properties" for child in element)
     
-    # Determine if this is a RadiusProfiles element
-    if element_tag.endswith("_Infrastructure") or element_tag.endswith("Controller") or "Wireless_Access" in element_tag:
-        # These elements typically go under RadiusProfiles/Children
-        parent_path = "./Children/Microsoft_Internet_Authentication_Service/Children/RadiusProfiles/Children"
-        parents = base_root.findall(parent_path)
-        if parents:
-            return parents[0]
+    # Helper function to check if an element exists at a specific path
+    def find_path(root, path):
+        current = root
+        for segment in path.split('/'):
+            if not segment:
+                continue
+            found = False
+            for child in current:
+                if child.tag == segment:
+                    current = child
+                    found = True
+                    break
+            if not found:
+                return None
+        return current
     
-    # Check if this is a RADIUS client (element with IP_Address property)
-    properties = element.find("./Properties")
-    if properties is not None:
-        for prop in properties:
-            if prop.tag == "IP_Address":
-                # This is a RADIUS client, should go under Microsoft_Radius_Protocol/Children/Clients/Children
-                parent_path = "./Children/Microsoft_Internet_Authentication_Service/Children/Protocols/Children/Microsoft_Radius_Protocol/Children/Clients/Children"
-                parents = base_root.findall(parent_path)
-                if parents:
-                    return parents[0]
+    # Handle RADIUS clients - elements with IP_Address in Properties
+    if has_properties:
+        properties = element.find("./Properties")
+        if properties is not None:
+            has_ip = any(prop.tag == "IP_Address" for prop in properties)
+            if has_ip:
+                # This is a RADIUS client, look for the clients container
+                client_path = "Children/Microsoft_Internet_Authentication_Service/Children/Protocols/Children/Microsoft_Radius_Protocol/Children/Clients/Children"
+                clients_container = find_path(base_root, client_path)
+                if clients_container is not None:
+                    return clients_container
+                
+                # Fallback: try a simpler path search
+                clients_containers = base_root.findall(".//Clients/Children")
+                if clients_containers:
+                    return clients_containers[0]
     
-    # If we couldn't determine the specific location, try to find by tag pattern matching
-    if element_tag.endswith("_network_mgmt_") or "_Cisco_" in element_tag or "Wireless" in element_tag:
-        # This is likely a profile, try profiles location
-        parent_path = "./Children/Microsoft_Internet_Authentication_Service/Children/RadiusProfiles/Children"
-        parents = base_root.findall(parent_path)
-        if parents:
-            return parents[0]
+    # Look for the exact same parent path structure in the base XML
+    if source_root is not None:
+        # Try to determine the parent's path in the source XML
+        for parent in source_root.findall(".//*"):
+            for child in parent:
+                if child == element or (child.tag == element.tag and child.get('name') == element_name):
+                    # Found the parent in the source, now find the same path in base
+                    parent_tag = parent.tag
+                    parent_name = parent.get('name', '')
+                    
+                    # Look for a matching parent in the base XML
+                    for base_parent in base_root.findall(f".//*[@name='{parent_name}']"):
+                        if base_parent.tag == parent_tag:
+                            return base_parent
+                    
+                    # If no exact match, try just the tag
+                    for base_parent in base_root.findall(f".//{parent_tag}"):
+                        return base_parent
     
-    # Fall back to root Children as last resort
-    parents = base_root.findall("./Children")
-    if parents:
-        return parents[0]
+    # Handle specific NPS elements by likely container
+    known_containers = {
+        # For RadiusProfiles
+        "RadiusProfiles": "Children/Microsoft_Internet_Authentication_Service/Children/RadiusProfiles/Children",
+        # For NetworkPolicy
+        "NetworkPolicy": "Children/Microsoft_Internet_Authentication_Service/Children/NetworkPolicy/Children",
+        # For Proxy_Policies
+        "Proxy_Policies": "Children/Microsoft_Internet_Authentication_Service/Children/Proxy_Policies/Children",
+        # For Proxy_Profiles
+        "Proxy_Profiles": "Children/Microsoft_Internet_Authentication_Service/Children/Proxy_Profiles/Children",
+        # For RADIUS server groups
+        "RADIUS_Server_Groups": "Children/Microsoft_Internet_Authentication_Service/Children/RADIUS_Server_Groups/Children",
+        # For Vendors
+        "Vendors": "Children/Microsoft_Internet_Authentication_Service/Children/Protocols/Children/Microsoft_Radius_Protocol/Children/Vendors/Children"
+    }
     
-    # If all else fails, return the root
+    # First check direct element tag match
+    for container_name, path in known_containers.items():
+        if element_tag == container_name:
+            container = find_path(base_root, path)
+            if container is not None:
+                return container
+    
+    # Then check if the element belongs in one of these containers
+    for container_name, path in known_containers.items():
+        # Look for existing elements with same tag in this container
+        container = find_path(base_root, path)
+        if container is not None:
+            for child in container:
+                if child.tag == element_tag:
+                    return container
+    
+    # Look for a Children element that already has this element's tag
+    for children in base_root.findall(".//Children"):
+        for child in children:
+            if child.tag == element_tag:
+                return children
+    
+    # Last resort - find a generic Children container
+    children_containers = base_root.findall(".//Children")
+    if children_containers:
+        return children_containers[0]
+    
+    # Absolute last resort: return the root
     return base_root
 
-def merge_nps_files(input_files, output_file):
+def merge_xml_files(input_files, output_file, verbose=False):
     """
-    Merge multiple NPS XML files, preserving hierarchy and deduplicating elements.
+    Merge multiple XML files, preserving hierarchy and deduplicating elements with Properties.
+    
+    Args:
+        input_files: List of input XML file paths
+        output_file: Path to the output merged XML file
+        verbose: Whether to output verbose logs
+    
+    Returns:
+        True if successful, False otherwise
     """
     if not input_files:
         print("Error: No input files provided")
@@ -110,13 +289,13 @@ def merge_nps_files(input_files, output_file):
         
         # First, catalog all existing elements in the base file that have Properties
         for elem in base_root.findall(".//*"):
-            for child in elem:
-                if child.tag == "Properties":
-                    key = get_element_id(elem)
-                    seen_elements[key] = elem
-                    break
+            has_properties = any(child.tag == "Properties" for child in elem)
+            if has_properties:
+                key = get_element_id(elem)
+                seen_elements[key] = elem
         
-        print(f"Found {len(seen_elements)} unique elements with Properties in base file")
+        if verbose:
+            print(f"Found {len(seen_elements)} unique elements with Properties in base file")
         
         # Process each additional file
         for file_idx, file_path in enumerate(input_files[1:], 1):
@@ -130,13 +309,13 @@ def merge_nps_files(input_files, output_file):
                 
                 # First, identify all elements with Properties in the merge file
                 elements_with_properties = []
-                for parent in merge_root.findall(".//*"):
-                    for child in parent:
-                        if child.tag == "Properties":
-                            elements_with_properties.append(parent)
-                            break
+                for elem in merge_root.findall(".//*"):
+                    has_properties = any(child.tag == "Properties" for child in elem)
+                    if has_properties:
+                        elements_with_properties.append(elem)
                 
-                print(f"  Found {len(elements_with_properties)} elements with Properties in {file_path}")
+                if verbose:
+                    print(f"  Found {len(elements_with_properties)} elements with Properties in {file_path}")
                 
                 # For each element with Properties, find its correct location in the base file
                 for element in elements_with_properties:
@@ -145,7 +324,8 @@ def merge_nps_files(input_files, output_file):
                     
                     # Skip if we've already seen this element
                     if key in seen_elements:
-                        print(f"  Skipping duplicate: {key}")
+                        if verbose:
+                            print(f"  Skipping duplicate: {key}")
                         continue
                     
                     # Find the correct parent in the base XML
@@ -181,8 +361,9 @@ def merge_nps_files(input_files, output_file):
             
             except Exception as e:
                 print(f"Error processing {file_path}: {str(e)}")
-                import traceback
-                traceback.print_exc()
+                if verbose:
+                    import traceback
+                    traceback.print_exc()
                 print(f"Skipping this file and continuing with others.")
                 continue
         
@@ -198,7 +379,7 @@ def merge_nps_files(input_files, output_file):
                     
                 base_tree.write(f, encoding='utf-8', xml_declaration=False)
             
-            print(f"Successfully merged NPS files into {output_file}")
+            print(f"Successfully merged XML files into {output_file}")
             return True
         
         except Exception as e:
@@ -207,14 +388,17 @@ def merge_nps_files(input_files, output_file):
     
     except Exception as e:
         print(f"Error during merge process: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        if verbose:
+            import traceback
+            traceback.print_exc()
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description='Merge Windows NPS XML files with hierarchy preservation')
-    parser.add_argument('input_files', nargs='+', help='Input NPS XML files to merge')
-    parser.add_argument('-o', '--output', default='merged_nps.xml', help='Output file (default: merged_nps.xml)')
+    parser = argparse.ArgumentParser(
+        description='Merge XML files while preserving hierarchy and deduplicating elements with Properties children'
+    )
+    parser.add_argument('input_files', nargs='+', help='Input XML files to merge')
+    parser.add_argument('-o', '--output', default='merged.xml', help='Output file (default: merged.xml)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     args = parser.parse_args()
     
@@ -227,11 +411,11 @@ def main():
             valid_files.append(file_path)
     
     if not valid_files:
-        print("Error: No valid NPS XML files to merge")
+        print("Error: No valid XML files to merge")
         return 1
     
     # Perform the merge
-    success = merge_nps_files(valid_files, args.output)
+    success = merge_xml_files(valid_files, args.output, args.verbose)
     return 0 if success else 1
 
 if __name__ == "__main__":
